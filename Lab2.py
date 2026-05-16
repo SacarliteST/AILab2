@@ -7,247 +7,317 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms, models
+from torchvision import transforms
+from torchvision.models.video import r3d_18, R3D_18_Weights
 from transformers import DistilBertTokenizer, DistilBertModel
 from PIL import Image
 from sklearn.metrics import classification_report, confusion_matrix
+from collections import defaultdict
 
 
-class MultimodalExperimentDataset(Dataset):
+class VideoMultimodalDataset(Dataset):
     """
-    Класс набора данных для загрузки синхронизированных пар (изображение, текст).
-    Обеспечивает изоляцию данных: принадлежность кадра к выборке определяется его видео-родителем.
+    Класс набора данных для загрузки мультимодальных видеоклипов.
+    Группирует извлеченные 2D-кадры в 3D-тензоры (последовательности) и склеивает текст субтитров.
+    Реализует различные стратегии сэмплирования для обучения и тестирования.
     """
 
-    def __init__(self, data_dir: str, split_csv_path: str, split_type: str = 'train'):
-        """
-        Инициализирует загрузчик данных.
-
-        Параметры:
-            data_dir (str): Путь к директории с данными (images, texts).
-            split_csv_path (str): Путь к файлу метаданных распределения.
-            split_type (str): Тип формируемой выборки ('train', 'val', 'test').
-        """
+    def __init__(self, data_dir: str, split_csv_path: str, split_type: str = 'train', seq_len: int = 8):
         self.img_dir = os.path.join(data_dir, 'images')
         self.txt_dir = os.path.join(data_dir, 'texts')
+        self.seq_len = seq_len
+        self.is_test = (split_type == 'test')
 
         df = pd.read_csv(split_csv_path)
-        self.df_split = df[df['split'] == split_type].copy()
+        df_split = df[df['split'] == split_type]
 
         unique_cats = sorted(df['category'].unique())
         self.class_to_idx = {cat: i for i, cat in enumerate(unique_cats)}
         self.idx_to_class = {i: cat for cat, i in self.class_to_idx.items()}
         self.num_classes = len(unique_cats)
 
-        self.samples = []
-        valid_ids = set(self.df_split['video_id'].tolist())
+        valid_ids = set(df_split['video_id'].tolist())
+        self.video_groups = defaultdict(list)
 
-        # Фильтрация файлов согласно принадлежности video_id к текущей выборке
-        for file in os.listdir(self.img_dir):
+        for file in sorted(os.listdir(self.img_dir)):
             if file.endswith('.jpg'):
                 video_id = file.split('_')[0]
                 base_name = file.replace('.jpg', '')
                 txt_path = os.path.join(self.txt_dir, f"{base_name}.txt")
 
                 if video_id in valid_ids and os.path.exists(txt_path):
-                    category = self.df_split[self.df_split['video_id'] == video_id]['category'].iloc[0]
-                    self.samples.append({
-                        'base_name': base_name,
-                        'label': self.class_to_idx[category]
-                    })
+                    self.video_groups[video_id].append(base_name)
+
+        self.valid_videos = []
+        for vid_id, frames in self.video_groups.items():
+            if len(frames) > 0:
+                category = df_split[df_split['video_id'] == vid_id]['category'].iloc[0]
+                self.valid_videos.append({
+                    'video_id': vid_id,
+                    'frames': frames,
+                    'label': self.class_to_idx[category]
+                })
 
         self.tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
         self.transform = transforms.Compose([
-            transforms.Resize((224, 224)),
+            transforms.Resize((112, 112)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean=[0.43216, 0.394666, 0.37645], std=[0.22803, 0.22145, 0.216989])
         ])
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.valid_videos)
 
     def __getitem__(self, idx: int) -> dict:
-        sample = self.samples[idx]
-        img_path = os.path.join(self.img_dir, f"{sample['base_name']}.jpg")
-        txt_path = os.path.join(self.txt_dir, f"{sample['base_name']}.txt")
+        sample = self.valid_videos[idx]
+        frame_names = sample['frames']
+        total_frames = len(frame_names)
 
-        img = Image.open(img_path).convert('RGB')
-        img_tensor = self.transform(img)
+        video_clips = []
 
-        with open(txt_path, 'r', encoding='utf-8') as f:
-            text = f.read()
+        if self.is_test:
+            num_clips = 3
+            step = max(1, total_frames // num_clips)
+            clips_indices = []
+            for i in range(num_clips):
+                start = i * step
+                end = min((i + 1) * step, total_frames) if i < num_clips - 1 else total_frames
+                indices = torch.linspace(start, end - 1, self.seq_len).long()
+                clips_indices.append(indices)
+        else:
+            clips_indices = [torch.linspace(0, total_frames - 1, self.seq_len).long()]
+
+        combined_text = ""
+        for base_name in frame_names:
+            txt_path = os.path.join(self.txt_dir, f"{base_name}.txt")
+            if os.path.exists(txt_path):
+                with open(txt_path, 'r', encoding='utf-8') as f:
+                    combined_text += f.read() + " "
+
+        for indices in clips_indices:
+            clip_tensors = []
+            for i in indices:
+                img_path = os.path.join(self.img_dir, f"{frame_names[i]}.jpg")
+                img = Image.open(img_path).convert('RGB')
+                clip_tensors.append(self.transform(img))
+            video_clips.append(torch.stack(clip_tensors, dim=1))
+
+        final_video_tensor = torch.stack(video_clips, dim=0)
 
         enc = self.tokenizer(
-            text, max_length=48, padding='max_length', truncation=True, return_tensors='pt'
+            combined_text.strip(), max_length=64, padding='max_length', truncation=True, return_tensors='pt'
         )
 
         return {
-            'base_name': sample['base_name'],
-            'img': img_tensor,
+            'video_id': sample['video_id'],
+            'video': final_video_tensor,
             'ids': enc['input_ids'].squeeze(0),
             'mask': enc['attention_mask'].squeeze(0),
             'label': torch.tensor(sample['label'], dtype=torch.long)
         }
 
 
-class MultimodalClassifier(nn.Module):
-    """
-    Архитектура нейронной сети для классификации кросс-модальных данных
-    на основе слияния признаков из ResNet-18 и DistilBERT.
-    """
-
+class MultimodalVideoClassifier(nn.Module):
     def __init__(self, num_classes: int):
-        """
-        Инициализирует модули извлечения признаков и полносвязный классификатор.
-
-        Параметры:
-            num_classes (int): Количество целевых классов для предсказания.
-        """
         super().__init__()
-        # Визуальный энкодер
-        self.resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-        self.resnet.fc = nn.Identity()
-
-        # Текстовый энкодер
+        self.video_resnet = r3d_18(weights=R3D_18_Weights.DEFAULT)
+        self.video_resnet.fc = nn.Identity()
         self.bert = DistilBertModel.from_pretrained('distilbert-base-uncased')
-
-        # Блок классификации (позднее слияние признаков: 512 + 768)
         self.classifier = nn.Sequential(
             nn.Linear(512 + 768, 512),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.4),
             nn.Linear(512, num_classes)
         )
 
-    def forward(self, img: torch.Tensor, ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        img_feat = self.resnet(img)
+    def forward(self, video: torch.Tensor, ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        vid_feat = self.video_resnet(video)
         txt_feat = self.bert(input_ids=ids, attention_mask=mask).last_hidden_state[:, 0, :]
-        return self.classifier(torch.cat((img_feat, txt_feat), dim=1))
+        combined_feat = torch.cat((vid_feat, txt_feat), dim=1)
+        return self.classifier(combined_feat)
+
+
+def get_model_and_optimizer(num_classes, lr, device):
+    """Вспомогательная функция для чистой инициализации модели и оптимизатора"""
+    model = MultimodalVideoClassifier(num_classes=num_classes).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    return model, optimizer
 
 
 def run_full_experiment():
-    """
-    Основной цикл эксперимента: инициализация данных, обучение модели
-    и оценка производительности на тестовой выборке с построением матрицы ошибок.
-    """
     CONFIG = {
-        'data_dir': '/content/drive/MyDrive/Dataset',
-        'split_csv': '/content/drive/MyDrive/Dataset/dataset_splits.csv',
-        'epochs': 10,
-        'batch_size': 16,
+        'data_dir': '/content/drive/MyDrive/Dataset_Local',
+        'split_csv': '/content/drive/MyDrive/dataset_splits.csv',
+        'search_epochs': 20,  # Эпохи для анализа сходимости
+        'batch_size': 4,
         'lr': 3e-5,
         'device': torch.device("cuda" if torch.cuda.is_available() else "cpu")
     }
 
-    train_ds = MultimodalExperimentDataset(CONFIG['data_dir'], CONFIG['split_csv'], 'train')
-    val_ds = MultimodalExperimentDataset(CONFIG['data_dir'], CONFIG['split_csv'], 'val')
-    test_ds = MultimodalExperimentDataset(CONFIG['data_dir'], CONFIG['split_csv'], 'test')
+    train_ds = VideoMultimodalDataset(CONFIG['data_dir'], CONFIG['split_csv'], 'train')
+    val_ds = VideoMultimodalDataset(CONFIG['data_dir'], CONFIG['split_csv'], 'val')
+    test_ds = VideoMultimodalDataset(CONFIG['data_dir'], CONFIG['split_csv'], 'test')
 
     train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=CONFIG['batch_size'], shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=CONFIG['batch_size'], shuffle=False)
 
-    model = MultimodalClassifier(num_classes=train_ds.num_classes).to(CONFIG['device'])
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=CONFIG['lr'])
 
-    print(f"Начало процесса обучения на устройстве: {CONFIG['device']}")
+    print(f"Используемое вычислительное устройство: {CONFIG['device']}")
 
-    for epoch in range(CONFIG['epochs']):
+    print(f"\n--- Запуск первичного цикла обучения (Анализ сходимости на {CONFIG['search_epochs']} эпох) ---")
+    model, optimizer = get_model_and_optimizer(train_ds.num_classes, CONFIG['lr'], CONFIG['device'])
+
+    best_val_loss = float('inf')
+    optimal_epoch = 1
+
+    for epoch in range(CONFIG['search_epochs']):
         model.train()
-        t_correct, t_total = 0, 0
-
         for batch in train_loader:
-            img = batch['img'].to(CONFIG['device'])
+            video = batch['video'].squeeze(1).to(CONFIG['device'])
             ids = batch['ids'].to(CONFIG['device'])
             mask = batch['mask'].to(CONFIG['device'])
             labels = batch['label'].to(CONFIG['device'])
 
             optimizer.zero_grad()
-            outputs = model(img, ids, mask)
+            outputs = model(video, ids, mask)
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
 
-            _, preds = torch.max(outputs, 1)
-            t_total += labels.size(0)
-            t_correct += (preds == labels).sum().item()
-
         model.eval()
-        v_correct, v_total = 0, 0
-
+        v_loss, v_correct, v_total = 0.0, 0, 0
         with torch.no_grad():
             for batch in val_loader:
-                img = batch['img'].to(CONFIG['device'])
+                video = batch['video'].squeeze(1).to(CONFIG['device'])
                 ids = batch['ids'].to(CONFIG['device'])
                 mask = batch['mask'].to(CONFIG['device'])
                 labels = batch['label'].to(CONFIG['device'])
 
-                outputs = model(img, ids, mask)
+                outputs = model(video, ids, mask)
+                loss = criterion(outputs, labels)
+                v_loss += loss.item() * labels.size(0)
+
                 _, preds = torch.max(outputs, 1)
                 v_total += labels.size(0)
                 v_correct += (preds == labels).sum().item()
 
-        print(
-            f"Эпоха {epoch + 1} | Точность (Train): {100 * t_correct / t_total:.1f}% | Точность (Val): {100 * v_correct / v_total:.1f}%")
+        epoch_val_loss = v_loss / v_total if v_total > 0 else 0
+        epoch_val_acc = 100 * v_correct / v_total if v_total > 0 else 0
 
-    # Этап тестирования и сбора метрик
+        print(
+            f"Эпоха {epoch + 1}/{CONFIG['search_epochs']} | Val Loss: {epoch_val_loss:.4f} | Val Acc: {epoch_val_acc:.1f}%")
+
+        if epoch_val_loss < best_val_loss:
+            best_val_loss = epoch_val_loss
+            optimal_epoch = epoch + 1
+
+    print(f"\nАнализ функции потерь: Оптимальное количество эпох до переобучения — {optimal_epoch}.")
+
+    print(f"\n--- Запуск финального цикла обучения ({optimal_epoch} эпох) ---")
+
+    model, optimizer = get_model_and_optimizer(train_ds.num_classes, CONFIG['lr'], CONFIG['device'])
+
+    for epoch in range(optimal_epoch):
+        model.train()
+        for batch in train_loader:
+            video = batch['video'].squeeze(1).to(CONFIG['device'])
+            ids = batch['ids'].to(CONFIG['device'])
+            mask = batch['mask'].to(CONFIG['device'])
+            labels = batch['label'].to(CONFIG['device'])
+
+            optimizer.zero_grad()
+            outputs = model(video, ids, mask)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        v_loss, v_correct, v_total = 0.0, 0, 0
+        with torch.no_grad():
+            for batch in val_loader:
+                video = batch['video'].squeeze(1).to(CONFIG['device'])
+                ids = batch['ids'].to(CONFIG['device'])
+                mask = batch['mask'].to(CONFIG['device'])
+                labels = batch['label'].to(CONFIG['device'])
+
+                outputs = model(video, ids, mask)
+                loss = criterion(outputs, labels)
+                v_loss += loss.item() * labels.size(0)
+                _, preds = torch.max(outputs, 1)
+                v_total += labels.size(0)
+                v_correct += (preds == labels).sum().item()
+
+        epoch_val_loss = v_loss / v_total if v_total > 0 else 0
+        epoch_val_acc = 100 * v_correct / v_total if v_total > 0 else 0
+        print(f"Эпоха {epoch + 1}/{optimal_epoch} | Val Loss: {epoch_val_loss:.4f} | Val Acc: {epoch_val_acc:.1f}%")
+
     y_true, y_pred, y_probs = [], [], []
     misclassified_examples = []
 
     model.eval()
     with torch.no_grad():
         for batch in test_loader:
-            img = batch['img'].to(CONFIG['device'])
+            video = batch['video'].to(CONFIG['device'])
+            batch_size, num_clips, c, t, h, w = video.size()
+            video_input = video.view(batch_size * num_clips, c, t, h, w)
+
             ids = batch['ids'].to(CONFIG['device'])
             mask = batch['mask'].to(CONFIG['device'])
-            labels = batch['label'].to(CONFIG['device'])
-            base_names = batch['base_name']
+            ids_input = ids.repeat_interleave(num_clips, dim=0)
+            mask_input = mask.repeat_interleave(num_clips, dim=0)
 
-            outputs = model(img, ids, mask)
-            probs = torch.softmax(outputs, dim=1)
-            _, preds = torch.max(outputs, 1)
+            labels = batch['label'].to(CONFIG['device'])
+            video_ids = batch['video_id']
+
+            outputs = model(video_input, ids_input, mask_input)
+            probs = torch.softmax(outputs, dim=1).view(batch_size, num_clips, -1)
+            avg_probs = torch.mean(probs, dim=1)
+
+            _, preds = torch.max(avg_probs, 1)
 
             y_true.extend(labels.cpu().numpy())
             y_pred.extend(preds.cpu().numpy())
-            y_probs.extend(probs.cpu().numpy())
+            y_probs.extend(avg_probs.cpu().numpy())
 
             for i in range(len(labels)):
                 if preds[i] != labels[i]:
                     misclassified_examples.append({
-                        'base_name': base_names[i],
+                        'video_id': video_ids[i],
                         'true_label': labels[i].item(),
                         'pred_label': preds[i].item()
                     })
 
     print("\nАнализ результатов тестирования:")
     target_names = [test_ds.idx_to_class[i] for i in range(test_ds.num_classes)]
-    print(classification_report(y_true, y_pred, target_names=target_names))
+    labels_indices = list(range(test_ds.num_classes))
+
+    print(classification_report(y_true, y_pred, labels=labels_indices, target_names=target_names, zero_division=0))
 
     k = min(3, test_ds.num_classes)
     if k > 1:
         top_k_preds = np.argsort(np.array(y_probs), axis=1)[:, -k:]
         correct_k = sum(y_true[i] in top_k_preds[i] for i in range(len(y_true)))
-        top_k_acc = correct_k / len(y_true)
+        top_k_acc = correct_k / len(y_true) if len(y_true) > 0 else 0
         print(f"Метрика Top-{k} Accuracy: {top_k_acc:.4f}")
 
-    # Визуализация матрицы ошибок
-    cm = confusion_matrix(y_true, y_pred)
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                xticklabels=target_names, yticklabels=target_names)
-    plt.xlabel('Предсказанный класс')
-    plt.ylabel('Истинный класс')
-    plt.title('Матрица классификационных ошибок')
-    plt.tight_layout()
-    plt.savefig('confusion_matrix.png')
+    if len(y_true) > 0:
+        cm = confusion_matrix(y_true, y_pred, labels=labels_indices)
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=target_names, yticklabels=target_names)
+        plt.xlabel('Предсказанный класс')
+        plt.ylabel('Истинный класс')
+        plt.title('Матрица классификационных ошибок')
+        plt.tight_layout()
+        plt.savefig('confusion_matrix.png')
 
-    print("\nРеестр неверных классификаций (первые 10 случаев):")
-    for idx, ex in enumerate(misclassified_examples[:10]):
-        true_class = test_ds.idx_to_class[ex['true_label']]
-        pred_class = test_ds.idx_to_class[ex['pred_label']]
-        print(
-            f"{idx + 1}. Идентификатор файла: {ex['base_name']} | Истинный класс: '{true_class}' | Предсказанный класс: '{pred_class}'")
+        print("\nРеестр неверных классификаций (первые 10 случаев):")
+        for idx, ex in enumerate(misclassified_examples[:10]):
+            true_class = test_ds.idx_to_class[ex['true_label']]
+            pred_class = test_ds.idx_to_class[ex['pred_label']]
+            print(
+                f"{idx + 1}. Видео ID: {ex['video_id']} | Истинный класс: '{true_class}' | Предсказанный класс: '{pred_class}'")
 
 
 if __name__ == '__main__':
