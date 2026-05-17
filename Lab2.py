@@ -28,6 +28,9 @@ class VideoMultimodalDataset(Dataset):
         self.seq_len = seq_len
         self.is_test = (split_type == 'test')
 
+        if not os.path.exists(split_csv_path):
+            raise FileNotFoundError(f"Файл метаданных не найден: {split_csv_path}")
+
         df = pd.read_csv(split_csv_path)
         df_split = df[df['split'] == split_type]
 
@@ -39,14 +42,15 @@ class VideoMultimodalDataset(Dataset):
         valid_ids = set(df_split['video_id'].tolist())
         self.video_groups = defaultdict(list)
 
-        for file in sorted(os.listdir(self.img_dir)):
-            if file.endswith('.jpg'):
-                video_id = file.split('_')[0]
-                base_name = file.replace('.jpg', '')
-                txt_path = os.path.join(self.txt_dir, f"{base_name}.txt")
+        if os.path.exists(self.img_dir):
+            for file in sorted(os.listdir(self.img_dir)):
+                if file.endswith('.jpg'):
+                    video_id = file.split('_')[0]
+                    base_name = file.replace('.jpg', '')
+                    txt_path = os.path.join(self.txt_dir, f"{base_name}.txt")
 
-                if video_id in valid_ids and os.path.exists(txt_path):
-                    self.video_groups[video_id].append(base_name)
+                    if video_id in valid_ids and os.path.exists(txt_path):
+                        self.video_groups[video_id].append(base_name)
 
         self.valid_videos = []
         for vid_id, frames in self.video_groups.items():
@@ -144,6 +148,36 @@ def get_model_and_optimizer(num_classes, lr, device):
     return model, optimizer
 
 
+def plot_history(history: dict, title: str, filename: str):
+    """
+    Генерирует стандартные графики изменения потерь и точности для отчета.
+    """
+    epochs = range(1, len(history['train_loss']) + 1)
+    plt.figure(figsize=(12, 5))
+
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, history['train_loss'], label='Train Loss', linewidth=2)
+    plt.plot(epochs, history['val_loss'], label='Val Loss', linewidth=2)
+    plt.title(f'{title}: Функция потерь')
+    plt.xlabel('Эпохи обучения')
+    plt.ylabel('Значение Loss')
+    plt.legend()
+    plt.grid(True)
+
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, history['train_acc'], label='Train Accuracy', linewidth=2)
+    plt.plot(epochs, history['val_acc'], label='Val Accuracy', linewidth=2)
+    plt.title(f'{title}: Динамика Accuracy')
+    plt.xlabel('Эпохи обучения')
+    plt.ylabel('Точность (%)')
+    plt.legend()
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300)
+    plt.close()
+
+
 def run_full_experiment():
     CONFIG = {
         'data_dir': '/content/drive/MyDrive/Dataset_Local',
@@ -154,9 +188,15 @@ def run_full_experiment():
         'device': torch.device("cuda" if torch.cuda.is_available() else "cpu")
     }
 
-    train_ds = VideoMultimodalDataset(CONFIG['data_dir'], CONFIG['split_csv'], 'train')
-    val_ds = VideoMultimodalDataset(CONFIG['data_dir'], CONFIG['split_csv'], 'val')
-    test_ds = VideoMultimodalDataset(CONFIG['data_dir'], CONFIG['split_csv'], 'test')
+    print(f"Используемое вычислительное устройство: {CONFIG['device']}")
+
+    try:
+        train_ds = VideoMultimodalDataset(CONFIG['data_dir'], CONFIG['split_csv'], 'train')
+        val_ds = VideoMultimodalDataset(CONFIG['data_dir'], CONFIG['split_csv'], 'val')
+        test_ds = VideoMultimodalDataset(CONFIG['data_dir'], CONFIG['split_csv'], 'test')
+    except Exception as e:
+        print(f"Критическая ошибка инициализации данных: {e}")
+        return
 
     train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=CONFIG['batch_size'], shuffle=False)
@@ -172,8 +212,12 @@ def run_full_experiment():
     best_val_loss = float('inf')
     optimal_epoch = 1
 
+    search_history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
+
     for epoch in range(CONFIG['search_epochs']):
+
         model.train()
+        t_loss, t_correct, t_total = 0.0, 0, 0
         for batch in train_loader:
             video = batch['video'].squeeze(1).to(CONFIG['device'])
             ids = batch['ids'].to(CONFIG['device'])
@@ -185,6 +229,14 @@ def run_full_experiment():
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
+
+            t_loss += loss.item() * labels.size(0)
+            _, preds = torch.max(outputs, 1)
+            t_total += labels.size(0)
+            t_correct += (preds == labels).sum().item()
+
+        epoch_train_loss = t_loss / t_total if t_total > 0 else 0
+        epoch_train_acc = 100 * t_correct / t_total if t_total > 0 else 0
 
         model.eval()
         v_loss, v_correct, v_total = 0.0, 0, 0
@@ -205,6 +257,11 @@ def run_full_experiment():
 
         epoch_val_loss = v_loss / v_total if v_total > 0 else 0
         epoch_val_acc = 100 * v_correct / v_total if v_total > 0 else 0
+
+        search_history['train_loss'].append(epoch_train_loss)
+        search_history['val_loss'].append(epoch_val_loss)
+        search_history['train_acc'].append(epoch_train_acc)
+        search_history['val_acc'].append(epoch_val_acc)
 
         print(
             f"Эпоха {epoch + 1}/{CONFIG['search_epochs']} | Val Loss: {epoch_val_loss:.4f} | Val Acc: {epoch_val_acc:.1f}%")
@@ -215,12 +272,18 @@ def run_full_experiment():
 
     print(f"\nАнализ функции потерь: Оптимальное количество эпох до переобучения — {optimal_epoch}.")
 
-    print(f"\n--- Запуск финального цикла обучения ({optimal_epoch} эпох) ---")
+    if len(search_history['train_loss']) > 0:
+        plot_history(search_history, "Динамика обучения (20 эпох)", "Chart1.png")
+        print("Графики анализа сходимости успешно сохранены в файл 'Chart1.png'")
 
+    print(f"\n--- Запуск финального цикла обучения ({optimal_epoch} эпох) ---")
     model, optimizer = get_model_and_optimizer(train_ds.num_classes, CONFIG['lr'], CONFIG['device'])
+
+    final_history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
 
     for epoch in range(optimal_epoch):
         model.train()
+        t_loss, t_correct, t_total = 0.0, 0, 0
         for batch in train_loader:
             video = batch['video'].squeeze(1).to(CONFIG['device'])
             ids = batch['ids'].to(CONFIG['device'])
@@ -232,6 +295,14 @@ def run_full_experiment():
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
+
+            t_loss += loss.item() * labels.size(0)
+            _, preds = torch.max(outputs, 1)
+            t_total += labels.size(0)
+            t_correct += (preds == labels).sum().item()
+
+        epoch_train_loss = t_loss / t_total if t_total > 0 else 0
+        epoch_train_acc = 100 * t_correct / t_total if t_total > 0 else 0
 
         model.eval()
         v_loss, v_correct, v_total = 0.0, 0, 0
@@ -251,7 +322,18 @@ def run_full_experiment():
 
         epoch_val_loss = v_loss / v_total if v_total > 0 else 0
         epoch_val_acc = 100 * v_correct / v_total if v_total > 0 else 0
+
+        final_history['train_loss'].append(epoch_train_loss)
+        final_history['val_loss'].append(epoch_val_loss)
+        final_history['train_acc'].append(epoch_train_acc)
+        final_history['val_acc'].append(epoch_val_acc)
+
         print(f"Эпоха {epoch + 1}/{optimal_epoch} | Val Loss: {epoch_val_loss:.4f} | Val Acc: {epoch_val_acc:.1f}%")
+
+    # [НОВАЯ ДОРАБОТКА] Отрисовка графиков финального обучения
+    if len(final_history['train_loss']) > 0:
+        plot_history(final_history, f"Финальное обучение ({optimal_epoch} эпох)", "Chart2.png")
+        print("Графики финального цикла успешно сохранены в файл 'Chart2.png'")
 
     y_true, y_pred, y_probs = [], [], []
     misclassified_examples = []
@@ -310,7 +392,8 @@ def run_full_experiment():
         plt.ylabel('Истинный класс')
         plt.title('Матрица классификационных ошибок')
         plt.tight_layout()
-        plt.savefig('confusion_matrix.png')
+        plt.savefig('Chart3.png', dpi=300)
+        print("Матрица ошибок успешно сохранена как 'Chart3.png'")
 
         print("\nРеестр неверных классификаций (первые 10 случаев):")
         for idx, ex in enumerate(misclassified_examples[:10]):
